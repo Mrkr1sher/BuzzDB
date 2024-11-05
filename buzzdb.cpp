@@ -220,6 +220,25 @@ public:
     }
 };
 
+class VectorIndex {
+    private:
+    struct Node {
+        std::vector<float> center;
+        std::vector<size_t> point_ids;
+        std::unique_ptr<Node> left;
+        std::unique_ptr<Node> right;
+        size_t split_dim;
+        
+        Node(const std::vector<float>& center) 
+            : center(center), split_dim(0) {}
+    };
+
+    std::unique_ptr<Node> root;
+    size_t dimensions;
+    static constexpr size_t MAX_POINTS_PER_NODE = 10;
+    BufferManager& buffer_manager;
+};
+
 class Tuple
 {
 public:
