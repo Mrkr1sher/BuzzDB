@@ -208,6 +208,14 @@ public:
         case STRING:
             std::cout << asString();
             break;
+        case VECTOR:
+            auto vec = asVector();
+            std::cout << "[";
+            for (size_t i = 0; i < vec.size(); i++) {
+                std::cout << vec[i] << " ";
+            }
+            std::cout << "]";
+            break;
         }
     }
 };
