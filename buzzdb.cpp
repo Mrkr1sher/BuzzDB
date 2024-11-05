@@ -143,6 +143,12 @@ public:
         else if (type == FLOAT)
         {
             buffer << *reinterpret_cast<float *>(data.get()) << ' ';
+        } else if (type == VECTOR) {
+            auto vec = asVector();
+            buffer << vec.size() << ' ';
+            for (const auto& val : vec) {
+                buffer << val << ' ';
+            } ' ';
         }
         return buffer.str();
     }
@@ -176,6 +182,15 @@ public:
             float val;
             in >> val;
             return std::make_unique<Field>(val);
+        }
+        else if (type == VECTOR) {
+            size_t dim;
+            in >> dim;
+            std::vector<float> vec(dim);
+            for (size_t i = 0; i < dim; i++) {
+                in >> vec[i];
+            }
+            return std::make_unique<Field>(vec);
         }
         return nullptr;
     }
