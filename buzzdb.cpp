@@ -84,6 +84,17 @@ public:
                     vec.size() * sizeof(float));
     }
 
+    std::vector<float> asVector() const {
+        ASSERT_WITH_MESSAGE(type == VECTOR, "Field is not a vector");
+        uint32_t dim;
+        std::memcpy(&dim, data.get(), sizeof(uint32_t));
+        
+        std::vector<float> result(dim);
+        std::memcpy(result.data(), data.get() + sizeof(uint32_t), 
+                   dim * sizeof(float));
+        return result;
+    }
+
     Field &operator=(const Field &other)
     {
         if (&other == this)
