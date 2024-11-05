@@ -38,7 +38,8 @@ enum FieldType
 {
     INT,
     FLOAT,
-    STRING
+    STRING,
+    VECTOR
 };
 
 // Define a basic Field variant class that can hold different types
@@ -69,6 +70,18 @@ public:
         data_length = s.size() + 1; // include null-terminator
         data = std::make_unique<char[]>(data_length);
         std::memcpy(data.get(), s.c_str(), data_length);
+    }
+
+    Field(const std::vector<float> &vec) : type(VECTOR)
+    {
+        data_length = sizeof(uint32_t) + vec.size() * sizeof(float);
+        data = std::make_unique<char[]>(data_length);
+
+        uint32_t dim = vec.size();
+        std::memcpy(data.get(), &dim, sizeof(uint32_t));
+
+        std::memcpy(data.get() + sizeof(uint32_t), vec.data(),
+                    vec.size() * sizeof(float));
     }
 
     Field &operator=(const Field &other)
@@ -666,15 +679,15 @@ public:
 
         /// Get the index of the first key that is not less than than a provided key.
         /// @param[in] key          The key that should be searched.
-       std::pair<uint32_t, bool> lower_bound(const KeyT &key)
+        std::pair<uint32_t, bool> lower_bound(const KeyT &key)
         {
             ComparatorT comp;
             uint32_t idx = 0;
             uint32_t node_count = static_cast<uint32_t>(this->count);
-    while (idx < node_count - 1 && comp(this->keys[idx], key))
-        idx++;
-    bool found = (idx < node_count - 1) && !comp(keys[idx], key) && !comp(key, keys[idx]);
-    return {idx, found};
+            while (idx < node_count - 1 && comp(this->keys[idx], key))
+                idx++;
+            bool found = (idx < node_count - 1) && !comp(keys[idx], key) && !comp(key, keys[idx]);
+            return {idx, found};
         }
 
         /// Insert a key.
@@ -889,7 +902,9 @@ public:
             auto inner = static_cast<InnerNode *>(node);
             ComparatorT comp;
             uint32_t idx = 0;
-            idx = std::find_if(inner->keys, inner->keys + inner->count - 1, [&](const KeyT& k) { return comp(key, k); }) - inner->keys;
+            idx = std::find_if(inner->keys, inner->keys + inner->count - 1, [&](const KeyT &k)
+                               { return comp(key, k); }) -
+                  inner->keys;
             current_page_id = inner->children[idx];
         }
     }
@@ -1026,7 +1041,9 @@ public:
                 InnerNode *inner = static_cast<InnerNode *>(node);
                 ComparatorT comp;
                 uint32_t idx = 0;
-                idx = std::find_if(inner->keys, inner->keys + inner->count - 1, [&](const KeyT& k) { return comp(key, k); }) - inner->keys;
+                idx = std::find_if(inner->keys, inner->keys + inner->count - 1, [&](const KeyT &k)
+                                   { return comp(key, k); }) -
+                      inner->keys;
                 current_page_id = inner->children[idx];
             }
         }
