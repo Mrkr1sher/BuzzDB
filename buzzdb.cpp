@@ -237,6 +237,100 @@ class VectorIndex {
     size_t dimensions;
     static constexpr size_t MAX_POINTS_PER_NODE = 10;
     BufferManager& buffer_manager;
+
+    public:
+    VectorIndex(size_t dims, BufferManager& bm) 
+        : dimensions(dims), buffer_manager(bm) {}
+
+    void insert(const std::vector<float>& point, size_t point_id) {
+        if (!root) {
+            root = std::make_unique<Node>(point);
+            root->point_ids.push_back(point_id);
+            return;
+        }
+        insertRecursive(root.get(), point, point_id);
+    }
+
+    std::vector<size_t> knnSearch(const std::vector<float>& query, size_t k) {
+        std::priority_queue<std::pair<float, size_t>> results;
+        knnSearchRecursive(root.get(), query, k, results);
+        
+        std::vector<size_t> neighbors;
+        while (!results.empty()) {
+            neighbors.push_back(results.top().second);
+            results.pop();
+        }
+        std::reverse(neighbors.begin(), neighbors.end());
+        return neighbors;
+    }
+    private:
+    void insertRecursive(Node* node, const std::vector<float>& point, 
+                        size_t point_id) {
+        if (node->point_ids.size() < MAX_POINTS_PER_NODE) {
+            node->point_ids.push_back(point_id);
+            return;
+        }
+
+        if (!node->left) {
+            float split_value = node->center[node->split_dim];
+            
+            if (point[node->split_dim] < split_value) {
+                node->left = std::make_unique<Node>(point);
+                node->left->split_dim = (node->split_dim + 1) % dimensions;
+                node->left->point_ids.push_back(point_id);
+            } else {
+                node->right = std::make_unique<Node>(point);
+                node->right->split_dim = (node->split_dim + 1) % dimensions;
+                node->right->point_ids.push_back(point_id);
+            }
+            return;
+        }
+
+        if (point[node->split_dim] < node->center[node->split_dim]) {
+            insertRecursive(node->left.get(), point, point_id);
+        } else {
+            insertRecursive(node->right.get(), point, point_id);
+        }
+    }
+
+    void knnSearchRecursive(Node* node, const std::vector<float>& query, 
+                           size_t k, 
+                           std::priority_queue<std::pair<float, size_t>>& results) {
+        if (!node) return;
+
+        for (size_t id : node->point_ids) {
+            float dist = computeDistance(query, node->center);
+            if (results.size() < k) {
+                results.push({dist, id});
+            } else if (dist < results.top().first) {
+                results.pop();
+                results.push({dist, id});
+            }
+        }
+
+        float diff = query[node->split_dim] - node->center[node->split_dim];
+        if (diff < 0) {
+            knnSearchRecursive(node->left.get(), query, k, results);
+            if (results.size() < k || std::abs(diff) < results.top().first) {
+                knnSearchRecursive(node->right.get(), query, k, results);
+            }
+        } else {
+            knnSearchRecursive(node->right.get(), query, k, results);
+            if (results.size() < k || std::abs(diff) < results.top().first) {
+                knnSearchRecursive(node->left.get(), query, k, results);
+            }
+        }
+    }
+
+    float computeDistance(const std::vector<float>& a, 
+                         const std::vector<float>& b) {
+        float dist = 0.0f;
+        for (size_t i = 0; i < dimensions; i++) {
+            float diff = a[i] - b[i];
+            dist += diff * diff;
+        }
+        return std::sqrt(dist);
+    }
 };
 
 class Tuple
