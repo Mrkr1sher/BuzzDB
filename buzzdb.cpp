@@ -13,6 +13,7 @@
 #include <thread>
 #include <queue>
 #include <optional>
+#include <cmath>
 #include <random>
 #include <mutex>
 #include <shared_mutex>
@@ -21,6 +22,10 @@
 #include <exception>
 #include <atomic>
 #include <set>
+
+#ifdef __unix__
+#include <unistd.h>
+#endif
 
 #define UNUSED(p) ((void)(p))
 
@@ -41,6 +46,16 @@ enum FieldType
     STRING,
     VECTOR
 };
+
+double getCurrentMemoryUsage() {
+    #ifdef __APPLE__
+        struct rusage rusage;
+        getrusage(RUSAGE_SELF, &rusage);
+        return static_cast<double>(rusage.ru_maxrss) * 1024;
+    #else
+        return 0.0;
+    #endif
+}
 
 // Define a basic Field variant class that can hold different types
 class Field
@@ -146,9 +161,10 @@ public:
         } else if (type == VECTOR) {
             auto vec = asVector();
             buffer << vec.size() << ' ';
+            buffer << std::fixed << std::setprecision(6);
             for (const auto& val : vec) {
                 buffer << val << ' ';
-            } ' ';
+            }
         }
         return buffer.str();
     }
@@ -195,6 +211,35 @@ public:
         return nullptr;
     }
 
+    static float computeL2Distance(const std::vector<float>& a, 
+                                 const std::vector<float>& b) {
+        ASSERT_WITH_MESSAGE(a.size() == b.size(), 
+            "Vectors must have same dimension");
+        float dist = 0.0f;
+        for (size_t i = 0; i < a.size(); i++) {
+            float diff = a[i] - b[i];
+            dist += diff * diff;
+        }
+        return std::sqrt(dist);
+    }
+
+    // Add vector normalization
+    static std::vector<float> normalizeVector(const std::vector<float>& vec) {
+        float magnitude = 0.0f;
+        for (float val : vec) {
+            magnitude += val * val;
+        }
+        magnitude = std::sqrt(magnitude);
+        
+        if (magnitude == 0) return vec;
+        
+        std::vector<float> normalized(vec.size());
+        for (size_t i = 0; i < vec.size(); i++) {
+            normalized[i] = vec[i] / magnitude;
+        }
+        return normalized;
+    }
+
     void print() const
     {
         switch (getType())
@@ -220,116 +265,30 @@ public:
     }
 };
 
+// Base class for vector indexes
 class VectorIndex {
-    private:
-    struct Node {
-        std::vector<float> center;
-        std::vector<size_t> point_ids;
-        std::unique_ptr<Node> left;
-        std::unique_ptr<Node> right;
-        size_t split_dim;
+public:
+    virtual ~VectorIndex() = default;
+    
+    virtual void insert(const std::vector<float>& point, size_t point_id) = 0;
+    
+    virtual std::vector<std::pair<size_t, float>> search(
+        const std::vector<float>& query,
+        size_t k,
+        size_t ef = 50) const = 0;
         
-        Node(const std::vector<float>& center) 
-            : center(center), split_dim(0) {}
-    };
-
-    std::unique_ptr<Node> root;
-    size_t dimensions;
-    static constexpr size_t MAX_POINTS_PER_NODE = 10;
-    BufferManager& buffer_manager;
-
-    public:
-    VectorIndex(size_t dims, BufferManager& bm) 
-        : dimensions(dims), buffer_manager(bm) {}
-
-    void insert(const std::vector<float>& point, size_t point_id) {
-        if (!root) {
-            root = std::make_unique<Node>(point);
-            root->point_ids.push_back(point_id);
-            return;
-        }
-        insertRecursive(root.get(), point, point_id);
-    }
-
-    std::vector<size_t> knnSearch(const std::vector<float>& query, size_t k) {
-        std::priority_queue<std::pair<float, size_t>> results;
-        knnSearchRecursive(root.get(), query, k, results);
-        
-        std::vector<size_t> neighbors;
-        while (!results.empty()) {
-            neighbors.push_back(results.top().second);
-            results.pop();
-        }
-        std::reverse(neighbors.begin(), neighbors.end());
-        return neighbors;
-    }
-    private:
-    void insertRecursive(Node* node, const std::vector<float>& point, 
-                        size_t point_id) {
-        if (node->point_ids.size() < MAX_POINTS_PER_NODE) {
-            node->point_ids.push_back(point_id);
-            return;
-        }
-
-        if (!node->left) {
-            float split_value = node->center[node->split_dim];
-            
-            if (point[node->split_dim] < split_value) {
-                node->left = std::make_unique<Node>(point);
-                node->left->split_dim = (node->split_dim + 1) % dimensions;
-                node->left->point_ids.push_back(point_id);
-            } else {
-                node->right = std::make_unique<Node>(point);
-                node->right->split_dim = (node->split_dim + 1) % dimensions;
-                node->right->point_ids.push_back(point_id);
-            }
-            return;
-        }
-
-        if (point[node->split_dim] < node->center[node->split_dim]) {
-            insertRecursive(node->left.get(), point, point_id);
-        } else {
-            insertRecursive(node->right.get(), point, point_id);
-        }
-    }
-
-    void knnSearchRecursive(Node* node, const std::vector<float>& query, 
-                           size_t k, 
-                           std::priority_queue<std::pair<float, size_t>>& results) {
-        if (!node) return;
-
-        for (size_t id : node->point_ids) {
-            float dist = computeDistance(query, node->center);
-            if (results.size() < k) {
-                results.push({dist, id});
-            } else if (dist < results.top().first) {
-                results.pop();
-                results.push({dist, id});
+    virtual std::vector<std::pair<size_t, float>> rangeSearch(
+        const std::vector<float>& query,
+        float radius) const {
+        // Default implementation using k-NN search
+        auto knn_results = search(query, 100);  // Get enough neighbors
+        std::vector<std::pair<size_t, float>> range_results;
+        for (const auto& result : knn_results) {
+            if (result.second <= radius) {
+                range_results.push_back(result);
             }
         }
-
-        float diff = query[node->split_dim] - node->center[node->split_dim];
-        if (diff < 0) {
-            knnSearchRecursive(node->left.get(), query, k, results);
-            if (results.size() < k || std::abs(diff) < results.top().first) {
-                knnSearchRecursive(node->right.get(), query, k, results);
-            }
-        } else {
-            knnSearchRecursive(node->right.get(), query, k, results);
-            if (results.size() < k || std::abs(diff) < results.top().first) {
-                knnSearchRecursive(node->left.get(), query, k, results);
-            }
-        }
-    }
-
-    float computeDistance(const std::vector<float>& a, 
-                         const std::vector<float>& b) {
-        float dist = 0.0f;
-        for (size_t i = 0; i < dimensions; i++) {
-            float diff = a[i] - b[i];
-            dist += diff * diff;
-        }
-        return std::sqrt(dist);
+        return range_results;
     }
 };
 
@@ -382,6 +341,27 @@ public:
         return tuple;
     }
 
+    std::unique_ptr<Tuple> clone() const {
+        auto new_tuple = std::make_unique<Tuple>();
+        for (const auto &field : fields) {
+            switch (field->getType()) {
+            case INT:
+                new_tuple->addField(std::make_unique<Field>(field->asInt()));
+                break;
+            case FLOAT:
+                new_tuple->addField(std::make_unique<Field>(field->asFloat()));
+                break;
+            case STRING:
+                new_tuple->addField(std::make_unique<Field>(field->asString()));
+                break;
+            case VECTOR:
+                new_tuple->addField(std::make_unique<Field>(field->asVector()));
+                break;
+            }
+        }
+        return new_tuple;
+    }
+
     void print() const
     {
         for (const auto &field : fields)
@@ -396,6 +376,11 @@ public:
 static constexpr size_t PAGE_SIZE = 4096;                      // Fixed page size
 static constexpr size_t MAX_SLOTS = 512;                       // Fixed number of slots
 static constexpr size_t MAX_PAGES = 1000;                      // Total Number of pages that can be stored
+constexpr size_t VECTOR_DIMENSION = 128; 
+constexpr size_t DEFAULT_M = 16;
+constexpr size_t DEFAULT_EF_CONSTRUCTION = 200;
+static const float LEVEL_MULTIPLIER = 1.0f / log(DEFAULT_M);
+constexpr size_t MAX_LEVEL = 6;
 uint16_t INVALID_VALUE = std::numeric_limits<uint16_t>::max(); // Sentinel value
 
 struct Slot
@@ -431,9 +416,6 @@ public:
         // Serialize the tuple into a char array
         auto serializedTuple = tuple->serialize();
         size_t tuple_size = serializedTuple.size();
-
-        // std::cout << "Tuple size: " << tuple_size << " bytes\n";
-        assert(tuple_size == 38);
 
         // Check for first slot with enough space
         size_t slot_itr = 0;
@@ -1197,399 +1179,932 @@ public:
     }
 };
 
-int main(int argc, char *argv[])
-{
-    bool execute_all = false;
-    std::string selected_test = "-1";
+class HNSWIndex : public VectorIndex {
+private:
+    struct Node {
+    size_t id;
+    std::vector<float> vector;
+    std::vector<std::vector<size_t>> neighbors;
+    size_t node_level;
 
-    if (argc < 2)
-    {
-        execute_all = true;
+    Node(size_t id, const std::vector<float>& vec, size_t node_level)
+        : id(id), vector(vec), neighbors(MAX_LEVEL + 1), node_level(node_level) {}
+};
+
+
+    size_t max_level;         
+    size_t M;                 // Max number of connections
+    size_t M_max0;   
+    float level_multiplier;   // To control level generation
+    size_t ef_construction;   // Size of dynamic candidate list during construction
+    size_t current_max_level;
+    
+    std::vector<std::unique_ptr<Node>> nodes;
+    std::vector<size_t> entry_points; 
+    size_t dimensions;
+    BufferManager& buffer_manager;
+
+    mutable std::vector<std::pair<float, size_t>> candidates_pool;
+    mutable std::vector<bool> visited_pool;
+
+public:
+    HNSWIndex(size_t dims, BufferManager& bm) 
+        : dimensions(dims), buffer_manager(bm), current_max_level(0) {
+        setParameters(); 
     }
-    else
-    {
-        selected_test = argv[1];
+    
+    void setParameters(size_t max_level_param = MAX_LEVEL,
+                      size_t M_param = DEFAULT_M,
+                      size_t ef_construction_param = DEFAULT_EF_CONSTRUCTION) {
+        max_level = max_level_param;
+        M = M_param;
+        M_max0 = 2 * M;
+        ef_construction = ef_construction_param;
+        level_multiplier = 1.0f / std::log(M);
+        
+        entry_points.resize(max_level + 1, 0);
+
+        candidates_pool.reserve(ef_construction * 2);
+        visited_pool.resize(1000000, false);
     }
-
-    using BTree = BTree<uint64_t, uint64_t, std::less<uint64_t>, 1024>;
-
-    // Test 1: InsertEmptyTree
-    if (execute_all || selected_test == "1")
-    {
-        std::cout << "...Starting Test 1" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-
-        ASSERT_WITH_MESSAGE(tree.root.has_value() == false,
-                            "tree.root is not nullptr");
-
-        tree.insert(42, 21);
-
-        ASSERT_WITH_MESSAGE(tree.root.has_value(),
-                            "tree.root is still nullptr after insertion");
-
-        std::string test = "inserting an element into an empty B-Tree";
-
-        // Fix root page and obtain root node pointer
-        SlottedPage *root_page = &buffer_manager.fix_page(*tree.root);
-        auto root_node = reinterpret_cast<BTree::Node *>(root_page->page_data.get());
-
-        ASSERT_WITH_MESSAGE(root_node->is_leaf() == true,
-                            test + " does not create a leaf node.");
-        ASSERT_WITH_MESSAGE(root_node->count == 1,
-                            test + " does not create a leaf node with count = 1.");
-
-        std::cout << "\033[1m\033[32mPassed: Test 1\033[0m" << std::endl;
+    
+    // Random level generation based on the paper
+    size_t getRandomLevel() {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_real_distribution<float> dis(0.0, 1.0);
+        
+        float r = -std::log(dis(gen)) * level_multiplier;
+        return std::min(static_cast<size_t>(r), max_level);
     }
-
-    // Test 2: InsertLeafNode
-    if (execute_all || selected_test == "2")
-    {
-        std::cout << "...Starting Test 2" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-
-        ASSERT_WITH_MESSAGE(tree.root.has_value() == false,
-                            "tree.root is not nullptr");
-
-        for (auto i = 0ul; i < BTree::LeafNode::kCapacity; ++i)
-        {
-            tree.insert(i, 2 * i);
-        }
-        ASSERT_WITH_MESSAGE(tree.root.has_value(),
-                            "tree.root is still nullptr after insertion");
-
-        std::string test = "inserting BTree::LeafNode::kCapacity elements into an empty B-Tree";
-
-        SlottedPage *root_page = &buffer_manager.fix_page(*tree.root);
-        auto root_node = reinterpret_cast<BTree::Node *>(root_page->page_data.get());
-        auto root_inner_node = static_cast<BTree::InnerNode *>(root_node);
-
-        ASSERT_WITH_MESSAGE(root_node->is_leaf() == true,
-                            test + " creates an inner node as root.");
-        ASSERT_WITH_MESSAGE(root_inner_node->count == BTree::LeafNode::kCapacity,
-                            test + " does not store all elements.");
-
-        std::cout << "\033[1m\033[32mPassed: Test 2\033[0m" << std::endl;
+    
+    float distance(const std::vector<float>& a, const std::vector<float>& b) const {
+        return Field::computeL2Distance(a, b);
     }
-
-    // Test 3: InsertLeafNodeSplit
-    if (execute_all || selected_test == "3")
-    {
-        std::cout << "...Starting Test 3" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-
-        ASSERT_WITH_MESSAGE(tree.root.has_value() == false,
-                            "tree.root is not nullptr");
-
-        for (auto i = 0ul; i < BTree::LeafNode::kCapacity; ++i)
-        {
-            tree.insert(i, 2 * i);
+    
+    void selectNeighbors(const std::vector<float>& q,
+                        const std::vector<std::pair<size_t, float>>& candidates,
+                        size_t M_max,
+                        std::vector<size_t>& selected) {
+        
+        selected.clear();
+        if (candidates.empty()) return;
+        
+        std::vector<std::pair<size_t, float>> sorted_candidates = candidates;
+        std::sort(sorted_candidates.begin(), sorted_candidates.end(),
+                 [](const auto& a, const auto& b) { return a.second < b.second; });
+        
+        // Take at most M_max neighbors
+        for (size_t i = 0; i < std::min(M_max, sorted_candidates.size()); ++i) {
+            selected.push_back(sorted_candidates[i].first);
         }
-        ASSERT_WITH_MESSAGE(tree.root.has_value(),
-                            "tree.root is still nullptr after insertion");
-
-        SlottedPage *root_page = &buffer_manager.fix_page(*tree.root);
-        auto root_node = reinterpret_cast<BTree::Node *>(root_page->page_data.get());
-        auto root_inner_node = static_cast<BTree::InnerNode *>(root_node);
-
-        assert(root_inner_node->is_leaf());
-        assert(root_inner_node->count == BTree::LeafNode::kCapacity);
-
-        // Let there be a split...
-        tree.insert(424242, 42);
-
-        std::string test =
-            "inserting BTree::LeafNode::kCapacity + 1 elements into an empty B-Tree";
-
-        ASSERT_WITH_MESSAGE(tree.root.has_value() != false, test + " removes the root :-O");
-
-        SlottedPage *root_page1 = &buffer_manager.fix_page(*tree.root);
-        root_node = reinterpret_cast<BTree::Node *>(root_page1->page_data.get());
-        root_inner_node = static_cast<BTree::InnerNode *>(root_node);
-
-        ASSERT_WITH_MESSAGE(root_inner_node->is_leaf() == false,
-                            test + " does not create a root inner node");
-        ASSERT_WITH_MESSAGE(root_inner_node->count == 2,
-                            test + " creates a new root with count != 2");
-
-        std::cout << "\033[1m\033[32mPassed: Test 3\033[0m" << std::endl;
     }
+    
+    std::vector<std::pair<size_t, float>> searchLayer(
+        const std::vector<float>& query,
+        size_t ef,
+        size_t ep,
+        size_t layer) const {
+        
+        if (ep >= nodes.size()) return {};
+        
+        if (layer > nodes[ep]->node_level) return {};
 
-    // Test 4: LookupEmptyTree
-    if (execute_all || selected_test == "4")
-    {
-        std::cout << "...Starting Test 4" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
+        std::set<size_t> visited{ep};
+        std::priority_queue<std::pair<float, size_t>> candidates;
+        std::priority_queue<std::pair<float, size_t>> best;
 
-        std::string test = "searching for a non-existing element in an empty B-Tree";
+        float dist_ep = distance(query, nodes[ep]->vector);
+        candidates.push({-dist_ep, ep});
+        best.push({dist_ep, ep});
 
-        ASSERT_WITH_MESSAGE(tree.lookup(42).has_value() == false,
-                            test + " seems to return something :-O");
+        while (!candidates.empty()) {
+            auto current = candidates.top();
+            candidates.pop();
 
-        std::cout << "\033[1m\033[32mPassed: Test 4\033[0m" << std::endl;
-    }
+            if (-current.first > best.top().first) break;
 
-    // Test 5: LookupSingleLeaf
-    if (execute_all || selected_test == "5")
-    {
-        std::cout << "...Starting Test 5" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-
-        // Fill one page
-        for (auto i = 0ul; i < BTree::LeafNode::kCapacity; ++i)
-        {
-            tree.insert(i, 2 * i);
-            ASSERT_WITH_MESSAGE(tree.lookup(i).has_value(),
-                                "searching for the just inserted key k=" + std::to_string(i) + " yields nothing");
-        }
-
-        // Lookup all values
-        for (auto i = 0ul; i < BTree::LeafNode::kCapacity; ++i)
-        {
-            auto v = tree.lookup(i);
-            ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(i) + " is missing");
-            ASSERT_WITH_MESSAGE(*v == 2 * i, "key=" + std::to_string(i) + " should have the value v=" + std::to_string(2 * i));
-        }
-
-        std::cout << "\033[1m\033[32mPassed: Test 5\033[0m" << std::endl;
-    }
-
-    // Test 6: LookupSingleSplit
-    if (execute_all || selected_test == "6")
-    {
-        std::cout << "...Starting Test 6" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-
-        // Insert values
-        for (auto i = 0ul; i < BTree::LeafNode::kCapacity; ++i)
-        {
-            tree.insert(i, 2 * i);
-        }
-
-        tree.insert(BTree::LeafNode::kCapacity, 2 * BTree::LeafNode::kCapacity);
-        ASSERT_WITH_MESSAGE(tree.lookup(BTree::LeafNode::kCapacity).has_value(),
-                            "searching for the just inserted key k=" + std::to_string(BTree::LeafNode::kCapacity + 1) + " yields nothing");
-
-        // Lookup all values
-        for (auto i = 0ul; i < BTree::LeafNode::kCapacity + 1; ++i)
-        {
-            auto v = tree.lookup(i);
-            ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(i) + " is missing");
-            ASSERT_WITH_MESSAGE(*v == 2 * i,
-                                "key=" + std::to_string(i) + " should have the value v=" + std::to_string(2 * i));
-        }
-
-        std::cout << "\033[1m\033[32mPassed: Test 6\033[0m" << std::endl;
-    }
-
-    // Test 7: LookupMultipleSplitsIncreasing
-    if (execute_all || selected_test == "7")
-    {
-        std::cout << "...Starting Test 7" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-        auto n = 40 * BTree::LeafNode::kCapacity;
-
-        // Insert values
-        for (auto i = 0ul; i < n; ++i)
-        {
-            tree.insert(i, 2 * i);
-            ASSERT_WITH_MESSAGE(tree.lookup(i).has_value(),
-                                "searching for the just inserted key k=" + std::to_string(i) + " yields nothing");
-        }
-
-        // Lookup all values
-        for (auto i = 0ul; i < n; ++i)
-        {
-            auto v = tree.lookup(i);
-            ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(i) + " is missing");
-            ASSERT_WITH_MESSAGE(*v == 2 * i,
-                                "key=" + std::to_string(i) + " should have the value v=" + std::to_string(2 * i));
-        }
-        std::cout << "\033[1m\033[32mPassed: Test 7\033[0m" << std::endl;
-    }
-
-    // Test 8: LookupMultipleSplitsDecreasing
-    if (execute_all || selected_test == "8")
-    {
-        std::cout << "...Starting Test 8" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-        auto n = 10 * BTree::LeafNode::kCapacity;
-
-        // Insert values
-        for (auto i = n; i > 0; --i)
-        {
-            tree.insert(i, 2 * i);
-            ASSERT_WITH_MESSAGE(tree.lookup(i).has_value(),
-                                "searching for the just inserted key k=" + std::to_string(i) + " yields nothing");
-        }
-
-        // Lookup all values
-        for (auto i = n; i > 0; --i)
-        {
-            auto v = tree.lookup(i);
-            ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(i) + " is missing");
-            ASSERT_WITH_MESSAGE(*v == 2 * i,
-                                "key=" + std::to_string(i) + " should have the value v=" + std::to_string(2 * i));
-        }
-
-        std::cout << "\033[1m\033[32mPassed: Test 8\033[0m" << std::endl;
-    }
-
-    // Test 9: LookupRandomNonRepeating
-    if (execute_all || selected_test == "9")
-    {
-        std::cout << "...Starting Test 9" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-        auto n = 10 * BTree::LeafNode::kCapacity;
-
-        // Generate random non-repeating key sequence
-        std::vector<uint64_t> keys(n);
-        std::iota(keys.begin(), keys.end(), n);
-        std::mt19937_64 engine(0);
-        std::shuffle(keys.begin(), keys.end(), engine);
-
-        // Insert values
-        for (auto i = 0ul; i < n; ++i)
-        {
-            tree.insert(keys[i], 2 * keys[i]);
-            ASSERT_WITH_MESSAGE(tree.lookup(keys[i]).has_value(),
-                                "searching for the just inserted key k=" + std::to_string(keys[i]) +
-                                    " after i=" + std::to_string(i) + " inserts yields nothing");
-        }
-
-        // Lookup all values
-        for (auto i = 0ul; i < n; ++i)
-        {
-            auto v = tree.lookup(keys[i]);
-            ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(keys[i]) + " is missing");
-            ASSERT_WITH_MESSAGE(*v == 2 * keys[i],
-                                "key=" + std::to_string(keys[i]) + " should have the value v=" + std::to_string(2 * keys[i]));
-        }
-
-        std::cout << "\033[1m\033[32mPassed: Test 9\033[0m" << std::endl;
-    }
-
-    // Test 10: LookupRandomRepeating
-    if (execute_all || selected_test == "10")
-    {
-        std::cout << "...Starting Test 10" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-        auto n = 10 * BTree::LeafNode::kCapacity;
-
-        // Insert & updated 100 keys at random
-        std::mt19937_64 engine{0};
-        std::uniform_int_distribution<uint64_t> key_distr(0, 99);
-        std::vector<uint64_t> values(100);
-
-        for (auto i = 1ul; i < n; ++i)
-        {
-            uint64_t rand_key = key_distr(engine);
-            values[rand_key] = i;
-            tree.insert(rand_key, i);
-
-            auto v = tree.lookup(rand_key);
-            ASSERT_WITH_MESSAGE(v.has_value(),
-                                "searching for the just inserted key k=" + std::to_string(rand_key) +
-                                    " after i=" + std::to_string(i - 1) + " inserts yields nothing");
-            ASSERT_WITH_MESSAGE(*v == i,
-                                "overwriting k=" + std::to_string(rand_key) + " with value v=" + std::to_string(i) +
-                                    " failed");
-        }
-
-        // Lookup all values
-        for (auto i = 0ul; i < 100; ++i)
-        {
-            if (values[i] == 0)
-            {
-                continue;
-            }
-            auto v = tree.lookup(i);
-            ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(i) + " is missing");
-            ASSERT_WITH_MESSAGE(*v == values[i],
-                                "key=" + std::to_string(i) + " should have the value v=" + std::to_string(values[i]));
-        }
-
-        std::cout << "\033[1m\033[32mPassed: Test 10\033[0m" << std::endl;
-    }
-
-    // Test 11: Erase
-    if (execute_all || selected_test == "11")
-    {
-        std::cout << "...Starting Test 11" << std::endl;
-        BufferManager buffer_manager;
-        BTree tree(buffer_manager);
-
-        // Insert values
-        for (auto i = 0ul; i < 2 * BTree::LeafNode::kCapacity; ++i)
-        {
-            tree.insert(i, 2 * i);
-        }
-
-        // Iteratively erase all values
-        for (auto i = 0ul; i < 2 * BTree::LeafNode::kCapacity; ++i)
-        {
-            ASSERT_WITH_MESSAGE(tree.lookup(i).has_value(), "k=" + std::to_string(i) + " was not in the tree");
-            tree.erase(i);
-            ASSERT_WITH_MESSAGE(!tree.lookup(i), "k=" + std::to_string(i) + " was not removed from the tree");
-        }
-        std::cout << "\033[1m\033[32mPassed: Test 11\033[0m" << std::endl;
-    }
-
-    // Test 12: Persistant Btree
-    if (execute_all || selected_test == "12")
-    {
-        std::cout << "...Starting Test 12" << std::endl;
-        unsigned long n = 10 * BTree::LeafNode::kCapacity;
-
-        // Build a tree
-        {
-            BufferManager buffer_manager;
-            BTree tree(buffer_manager);
-
-            // Insert values
-            for (auto i = 0ul; i < n; ++i)
-            {
-                tree.insert(i, 2 * i);
-                ASSERT_WITH_MESSAGE(tree.lookup(i).has_value(),
-                                    "searching for the just inserted key k=" + std::to_string(i) + " yields nothing");
-            }
-
-            // Lookup all values
-            for (auto i = 0ul; i < n; ++i)
-            {
-                auto v = tree.lookup(i);
-                ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(i) + " is missing");
-                ASSERT_WITH_MESSAGE(*v == 2 * i,
-                                    "key=" + std::to_string(i) + " should have the value v=" + std::to_string(2 * i));
+            size_t current_id = current.second;
+            
+            if (layer <= nodes[current_id]->node_level) {
+                for (size_t neighbor_id : nodes[current_id]->neighbors[layer]) {
+                    if (neighbor_id >= nodes.size() || visited.count(neighbor_id) > 0) {
+                        continue;
+                    }
+                    
+                    visited.insert(neighbor_id);
+                    float dist = distance(query, nodes[neighbor_id]->vector);
+                    
+                    if (best.size() < ef || dist < best.top().first) {
+                        candidates.push({-dist, neighbor_id});
+                        best.push({dist, neighbor_id});
+                        
+                        if (best.size() > ef) {
+                            best.pop();
+                        }
+                    }
+                }
             }
         }
 
-        // recreate the buffer manager and check for existence of the tree
-        {
-            BufferManager buffer_manager(false);
-            BTree tree(buffer_manager);
-
-            // Lookup all values
-            for (auto i = 0ul; i < n; ++i)
-            {
-                auto v = tree.lookup(i);
-                ASSERT_WITH_MESSAGE(v.has_value(), "key=" + std::to_string(i) + " is missing");
-                ASSERT_WITH_MESSAGE(*v == 2 * i,
-                                    "key=" + std::to_string(i) + " should have the value v=" + std::to_string(2 * i));
-            }
+        std::vector<std::pair<size_t, float>> results;
+        while (!best.empty()) {
+            results.push_back({best.top().second, best.top().first});
+            best.pop();
         }
-
-        std::cout << "\033[1m\033[32mPassed: Test 12\033[0m" << std::endl;
+        
+        std::reverse(results.begin(), results.end());
+        return results;
+    }
+    
+    void checkDimensions(const std::vector<float>& vector) const {
+        ASSERT_WITH_MESSAGE(vector.size() == dimensions, 
+            "Vector dimension mismatch: expected " + 
+            std::to_string(dimensions) + ", got " + 
+            std::to_string(vector.size()));
     }
 
-    return 0;
+    void checkNodeId(size_t id) const {
+        ASSERT_WITH_MESSAGE(id < nodes.size(), 
+            "Invalid node id: " + std::to_string(id) + 
+            ", total nodes: " + std::to_string(nodes.size()));
+    }
+
+    void insert(const std::vector<float>& vector, size_t id) override {
+        try {
+            // std::cout << "[Insert] Starting insert for id " << id << "\n";
+            checkDimensions(vector);
+            
+            size_t level = getRandomLevel();
+            // std::cout << "[Insert] Generated level " << level << "\n";
+            
+            // If this is the first node
+            if (nodes.empty()) {
+                auto node = std::make_unique<Node>(id, vector, level);
+                nodes.push_back(std::move(node));
+                current_max_level = level;
+                
+                // Initialize entry points up to node's level
+                for (size_t i = 0; i <= level; ++i) {
+                    entry_points[i] = 0;
+                }
+                return;
+            }
+
+            size_t ep = entry_points[current_max_level];
+            
+            for (int lc = std::min(level, current_max_level); lc >= 0; --lc) {
+                auto nearest = searchLayer(vector, 1, ep, lc);
+                if (!nearest.empty()) {
+                    ep = nearest[0].first;
+                }
+            }
+
+            auto node = std::make_unique<Node>(id, vector, level);
+            nodes.push_back(std::move(node));
+            size_t node_idx = nodes.size() - 1;
+
+            if (level > current_max_level) {
+                for (size_t l = current_max_level + 1; l <= level; ++l) {
+                    entry_points[l] = node_idx;
+                }
+                current_max_level = level;
+            }
+
+            for (size_t lc = 0; lc <= level; ++lc) {
+                auto neighbors = searchLayer(vector, ef_construction, ep, lc);
+                if (neighbors.empty()) continue;
+
+                std::vector<size_t> selected;
+                size_t M_max = (lc == 0) ? M_max0 : M;
+                
+                for (size_t i = 0; i < std::min(M_max, neighbors.size()); ++i) {
+                    size_t neighbor_id = neighbors[i].first;
+                    if (neighbor_id < nodes.size() && neighbor_id != node_idx) {
+                        selected.push_back(neighbor_id);
+                    }
+                }
+
+                for (size_t neighbor_id : selected) {
+                    if (lc <= nodes[neighbor_id]->node_level) {
+                        nodes[node_idx]->neighbors[lc].push_back(neighbor_id);
+                        nodes[neighbor_id]->neighbors[lc].push_back(node_idx);
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            // std::cerr << "[Insert] Exception: " << e.what() << "\n";
+            throw;
+        }
+    }
+
+    std::vector<std::pair<size_t, float>> search(
+        const std::vector<float>& query, 
+        size_t k,
+        size_t ef = 50) const override {
+        
+        // std::cout << "[Search] Starting with k=" << k 
+        //           << ", ef=" << ef 
+        //           << ", nodes.size=" << nodes.size() 
+        //           << ", max_level=" << max_level << "\n";
+        
+        if (nodes.empty()) {
+            // std::cout << "[Search] Index is empty\n";
+            return {};
+        }
+
+        size_t ep = entry_points[max_level];
+        // std::cout << "[Search] Initial entry point: " << ep << "\n";
+        
+        if (ep >= nodes.size()) {
+            // std::cout << "[Search] Invalid entry point\n";
+            return {};
+        }
+
+        for (int level = max_level; level >= 0; level--) {
+            // std::cout << "[Search] Searching layer " << level 
+                    //   << " with entry point " << ep << "\n";
+            
+            if (level > 0) {
+                auto layer_results = searchLayer(query, 1, ep, level);
+                if (!layer_results.empty()) {
+                    ep = layer_results[0].first;
+                    // std::cout << "[Search] New entry point: " << ep << "\n";
+                } else {
+                    // std::cout << "[Search] No results found at layer " << level << "\n";
+                }
+            } else {
+                // std::cout << "[Search] Searching ground layer with ef=" 
+                        //   << std::max(ef, k) << "\n";
+                auto results = searchLayer(query, std::max(ef, k), ep, 0);
+                
+                // std::cout << "[Search] Found " << results.size() 
+                        //   << " results at ground layer\n";
+                
+                if (results.size() > k) {
+                    results.resize(k);
+                }
+                return results;
+            }
+        }
+        
+        return {};
+    }
+};
+
+class KDTreeIndex : public VectorIndex {
+private:
+    struct Node {
+        std::vector<float> point;
+        size_t point_id;
+        size_t split_dim;
+        std::unique_ptr<Node> left;
+        std::unique_ptr<Node> right;
+        
+        Node(const std::vector<float>& p, size_t id) 
+            : point(p), point_id(id), split_dim(0) {}
+    };
+    
+    std::unique_ptr<Node> root;
+    size_t dimensions;
+    BufferManager& buffer_manager;
+    
+    Node* insertRecursive(std::unique_ptr<Node>& node, 
+                         const std::vector<float>& point,
+                         size_t point_id,
+                         size_t depth) {
+        if (!node) {
+            node = std::make_unique<Node>(point, point_id);
+            node->split_dim = depth % dimensions;
+            return node.get();
+        }
+        
+        size_t dim = depth % dimensions;
+        if (point[dim] < node->point[dim]) {
+            return insertRecursive(node->left, point, point_id, depth + 1);
+        } else {
+            return insertRecursive(node->right, point, point_id, depth + 1);
+        }
+    }
+    
+    void searchKNN(Node* node,
+                   const std::vector<float>& query,
+                   std::priority_queue<std::pair<float, size_t>>& pq,
+                   size_t k,
+                   size_t depth) const {
+        if (!node) return;
+        
+        float dist = Field::computeL2Distance(query, node->point);
+        
+        if (pq.size() < k) {
+            pq.push({dist, node->point_id});
+        } else if (dist < pq.top().first) {
+            pq.pop();
+            pq.push({dist, node->point_id});
+        }
+        
+        size_t dim = depth % dimensions;
+        float diff = query[dim] - node->point[dim];
+        
+        if (diff < 0) {
+            searchKNN(node->left.get(), query, pq, k, depth + 1);
+            if (pq.size() < k || std::abs(diff) < pq.top().first) {
+                searchKNN(node->right.get(), query, pq, k, depth + 1);
+            }
+        } else {
+            searchKNN(node->right.get(), query, pq, k, depth + 1);
+            if (pq.size() < k || std::abs(diff) < pq.top().first) {
+                searchKNN(node->left.get(), query, pq, k, depth + 1);
+            }
+        }
+    }
+    
+    float computeDistance(const std::vector<float>& a, 
+                         const std::vector<float>& b) const {
+        float dist = 0.0f;
+        for (size_t i = 0; i < dimensions; i++) {
+            float diff = a[i] - b[i];
+            dist += diff * diff;
+        }
+        return std::sqrt(dist);
+    }
+    
+public:
+    KDTreeIndex(size_t dims, BufferManager& bm) 
+        : dimensions(dims), buffer_manager(bm) {}
+    
+    void insert(const std::vector<float>& point, size_t point_id) override {
+        insertRecursive(root, point, point_id, 0);
+    }
+    
+    std::vector<std::pair<size_t, float>> search(
+        const std::vector<float>& query,
+        size_t k,
+        size_t ef = 50) const override {
+        
+        std::priority_queue<std::pair<float, size_t>> pq;
+        searchKNN(root.get(), query, pq, k, 0);
+        
+        std::vector<std::pair<size_t, float>> results;
+        while (!pq.empty()) {
+            results.push_back({pq.top().second, pq.top().first});
+            pq.pop();
+        }
+        std::reverse(results.begin(), results.end());
+        return results;
+    }
+};
+
+class VectorIndexBenchmark {
+private:
+    BufferManager buffer_manager;
+
+public:
+    VectorIndexBenchmark() : buffer_manager(true) {}
+
+    struct Metrics {
+        double build_time;
+        double query_time;
+        double memory_usage;
+        double accuracy;
+    };
+
+    struct IndexConfig {
+        std::string index_type;
+        size_t max_level;
+        size_t neighbors_size;
+        size_t ef_construction;
+        size_t leaf_size;
+    };
+
+    Metrics runBenchmark(const IndexConfig& config,
+                        const std::vector<std::vector<float>>& data,
+                        const std::vector<std::vector<float>>& queries,
+                        size_t k) {
+        Metrics metrics;
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        std::unique_ptr<VectorIndex> index;
+        if (config.index_type == "kdtree") {
+            index = std::make_unique<KDTreeIndex>(data[0].size(), buffer_manager);
+        } else if (config.index_type == "hnsw") {
+            auto hnsw = std::make_unique<HNSWIndex>(data[0].size(), buffer_manager);
+            hnsw->setParameters(config.max_level, config.neighbors_size, 
+                              config.ef_construction);
+            index = std::move(hnsw);
+        }
+
+        for (size_t i = 0; i < data.size(); ++i) {
+            index->insert(data[i], i);
+        }
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        metrics.build_time = std::chrono::duration<double>(end - start).count();
+
+        // Measure query time
+        start = std::chrono::high_resolution_clock::now();
+        for (const auto& query : queries) {
+            index->search(query, k);
+        }
+        end = std::chrono::high_resolution_clock::now();
+        metrics.query_time = std::chrono::duration<double>(end - start).count() 
+                           / queries.size();
+
+        // Measure memory usage
+        metrics.memory_usage = getCurrentMemoryUsage();
+
+        // Measure accuracy
+        metrics.accuracy = measureAccuracy(index.get(), queries, data, k);
+
+        return metrics;
+    }
+
+private:
+    std::vector<std::pair<size_t, float>> linearSearch(
+        const std::vector<float>& query,
+        const std::vector<std::vector<float>>& data,
+        size_t k) {
+        std::priority_queue<std::pair<float, size_t>> pq;
+        
+        for (size_t i = 0; i < data.size(); i++) {
+            float dist = Field::computeL2Distance(query, data[i]);
+            if (pq.size() < k) {
+                pq.push({dist, i});
+            } else if (dist < pq.top().first) {
+                pq.pop();
+                pq.push({dist, i});
+            }
+        }
+        
+        std::vector<std::pair<size_t, float>> result;
+        while (!pq.empty()) {
+            result.push_back({pq.top().second, pq.top().first});
+            pq.pop();
+        }
+        std::reverse(result.begin(), result.end());
+        return result;
+    }
+
+    double measureAccuracy(VectorIndex* index,
+                          const std::vector<std::vector<float>>& queries,
+                          const std::vector<std::vector<float>>& data,
+                          size_t k) {
+        double total_accuracy = 0.0;
+        
+        for (const auto& query : queries) {
+            auto approx_results = index->search(query, k);
+            auto exact_results = linearSearch(query, data, k);
+            
+            size_t correct = 0;
+            for (const auto& res : approx_results) {
+                if (std::find_if(exact_results.begin(), exact_results.end(),
+                    [&](const auto& exact) { 
+                        return exact.first == res.first; 
+                    }) != exact_results.end()) {
+                    correct++;
+                }
+            }
+            total_accuracy += static_cast<double>(correct) / k;
+        }
+        
+        return total_accuracy / queries.size();
+    }
+};
+
+class IndexAutoTuner {
+private:
+    struct TuningResult {
+        VectorIndexBenchmark::IndexConfig config;
+        VectorIndexBenchmark::Metrics metrics;
+        double score;
+    };
+
+public:
+    VectorIndexBenchmark::IndexConfig tune(
+        const std::vector<std::vector<float>>& sample_data,
+        const std::vector<std::vector<float>>& sample_queries,
+        size_t k,
+        double accuracy_weight = 0.4,
+        double speed_weight = 0.4,
+        double memory_weight = 0.2) {
+        
+        std::vector<TuningResult> results;
+        VectorIndexBenchmark benchmark;
+
+
+        std::vector<VectorIndexBenchmark::IndexConfig> configs = {
+
+            {"kdtree", 0, 0, 0, 10},
+            {"kdtree", 0, 0, 0, 20},
+            {"kdtree", 0, 0, 0, 50},
+            
+
+            {"hnsw", 4, 16, 100, 0},
+            {"hnsw", 4, 32, 200, 0},
+            {"hnsw", 6, 16, 100, 0},
+            {"hnsw", 6, 32, 200, 0}
+        };
+
+
+        for (const auto& config : configs) {
+            auto metrics = benchmark.runBenchmark(config, sample_data, 
+                                                sample_queries, k);
+            
+            double score = 
+                accuracy_weight * metrics.accuracy +
+                speed_weight * (1.0 / metrics.query_time) +
+                memory_weight * (1.0 / metrics.memory_usage);
+            
+            results.push_back({config, metrics, score});
+        }
+
+        auto best = std::max_element(results.begin(), results.end(),
+            [](const TuningResult& a, const TuningResult& b) {
+                return a.score < b.score;
+            });
+
+        return best->config;
+    }
+};
+
+class VectorQueryExecutor {
+private:
+    BufferManager& buffer_manager;
+    std::unique_ptr<HNSWIndex> hnsw_index;
+    std::unique_ptr<KDTreeIndex> kd_index;
+    
+public:
+    enum class QueryType {
+        KNN_SEARCH,
+        RANGE_SEARCH,
+        BATCH_SEARCH
+    };
+    
+    struct QueryResult {
+        std::vector<std::pair<size_t, float>> matches;
+        double execution_time;
+        std::string index_used;
+    };
+    
+    VectorQueryExecutor(BufferManager& bm) 
+        : buffer_manager(bm) {
+        hnsw_index = std::make_unique<HNSWIndex>(VECTOR_DIMENSION, buffer_manager);
+        kd_index = std::make_unique<KDTreeIndex>(VECTOR_DIMENSION, buffer_manager);
+        
+        hnsw_index->setParameters(4, 16, 100);
+    }
+    
+    QueryResult executeQuery(const std::vector<float>& query_vector,
+                           QueryType query_type,
+                           size_t k = 10,
+                           float radius = 1.0f) {
+        QueryResult result;
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        bool use_hnsw = shouldUseHNSW(query_type, k);
+        
+        switch (query_type) {
+            case QueryType::KNN_SEARCH:
+                if (use_hnsw) {
+                    result.matches = hnsw_index->search(query_vector, k);
+                    result.index_used = "HNSW";
+                } else {
+                    result.matches = kd_index->search(query_vector, k);
+                    result.index_used = "KD-tree";
+                }
+                break;
+                
+            case QueryType::RANGE_SEARCH:
+                result.matches = kd_index->rangeSearch(query_vector, radius);
+                result.index_used = "KD-tree";
+                break;
+                
+            case QueryType::BATCH_SEARCH:
+                result.matches = executeBatchSearch(query_vector, k);
+                result.index_used = "Batch-optimized";
+                break;
+        }
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        result.execution_time = 
+            std::chrono::duration<double>(end - start).count();
+        
+        return result;
+    }
+    
+    void insertVector(const std::vector<float>& vector, size_t id) {
+        hnsw_index->insert(vector, id);
+        kd_index->insert(vector, id);
+    }
+    
+private:
+    bool shouldUseHNSW(QueryType query_type, size_t k) {
+        if (query_type == QueryType::RANGE_SEARCH) {
+            return false;
+        }
+        if (k > 100) {
+            return false;
+        }
+        return true;
+    }
+    
+    std::vector<std::pair<size_t, float>> executeBatchSearch(
+        const std::vector<float>& query,
+        size_t k) {
+        return hnsw_index->search(query, k);
+    }
+};
+
+void testHNSW() {
+    std::cout << "Starting HNSW test...\n";
+    
+    BufferManager bm(true);
+    std::cout << "Created BufferManager\n";
+    
+    HNSWIndex index(3, bm);
+    std::cout << "Created HNSW index\n";
+    
+    std::vector<std::vector<float>> points = {
+        {1.0f, 0.0f, 0.0f},
+        {0.0f, 1.0f, 0.0f},
+        {0.0f, 0.0f, 1.0f},
+        {1.0f, 1.0f, 1.0f}
+    };
+    std::cout << "Created test points\n";
+    
+    for (size_t i = 0; i < points.size(); i++) {
+        std::cout << "Inserting point " << i << "\n";
+        index.insert(points[i], i);
+        std::cout << "Inserted point " << i << "\n";
+    }
+    
+    std::cout << "All points inserted\n";
+    
+    std::cout << "Starting search...\n";
+    auto results = index.search(points[0], 1);
+    std::cout << "Search completed\n";
+    
+    ASSERT_WITH_MESSAGE(results.size() == 1, "Should find exactly one match");
+    ASSERT_WITH_MESSAGE(results[0].first == 0, "Should find the exact point");
+    
+    std::cout << "HNSW tests passed!\n";
 }
+
+void testFieldSerialization() {
+    std::cout << "Running testFieldSerialization()...\n";
+    const size_t dim = 128;
+    std::vector<float> original(dim);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
+
+    for (auto &val : original) {
+        val = dist(gen);
+    }
+
+    Field originalField(original);
+    
+    std::stringstream ss;
+    ss << originalField.serialize();
+
+    std::stringstream iss(ss.str());
+    auto deserializedField = Field::deserialize(iss);
+    ASSERT_WITH_MESSAGE(deserializedField != nullptr, "Deserialization failed");
+
+    auto recovered = deserializedField->asVector();
+    ASSERT_WITH_MESSAGE(recovered.size() == original.size(), "Dimension mismatch after deserialization");
+    for (size_t i = 0; i < dim; i++) {
+        ASSERT_WITH_MESSAGE(std::fabs(recovered[i] - original[i]) < 1e-6f,
+                            "Value mismatch in deserialized vector");
+    }
+
+    std::cout << "testFieldSerialization passed!\n";
+}
+
+double computeRecall(
+    const std::vector<std::pair<size_t, float>>& approx_results,
+    const std::vector<std::pair<size_t, float>>& exact_results) 
+{
+    size_t correct = 0;
+    for (auto &res : approx_results) {
+        for (auto &ex : exact_results) {
+            if (res.first == ex.first) {
+                correct++;
+                break;
+            }
+        }
+    }
+    return static_cast<double>(correct) / exact_results.size();
+}
+
+void testKNNAccuracy(size_t dataset_size = 1000, size_t dims = 64, size_t k = 10) {
+    std::cout << "Running testKNNAccuracy() with dataset_size=" << dataset_size 
+              << ", dims=" << dims << ", k=" << k << "\n";
+
+    std::vector<std::vector<float>> data;
+    data.reserve(dataset_size);
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (size_t i = 0; i < dataset_size; i++) {
+        std::vector<float> vec(dims);
+        for (auto &val : vec) val = dist(gen);
+        data.push_back(std::move(vec));
+    }
+
+    BufferManager bm(true);
+    KDTreeIndex kd(dims, bm);
+    HNSWIndex hnsw(dims, bm);
+    hnsw.setParameters(4,16,100);
+    
+    for (size_t i = 0; i < dataset_size; i++) {
+        kd.insert(data[i], i);
+        hnsw.insert(data[i], i);
+    }
+
+    size_t test_queries = 100;
+    double total_recall = 0.0;
+    for (size_t qi = 0; qi < test_queries; qi++) {
+        size_t query_id = qi % dataset_size;
+        auto exact = kd.search(data[query_id], k);
+        auto approx = hnsw.search(data[query_id], k);
+
+        double recall = computeRecall(approx, exact);
+        total_recall += recall;
+    }
+
+    double avg_recall = total_recall / test_queries;
+    std::cout << "Average recall over " << test_queries << " queries: " << (avg_recall*100) << "%\n";
+    ASSERT_WITH_MESSAGE(avg_recall > 0.8, "Recall is too low, expected at least 80%");
+    std::cout << "testKNNAccuracy passed!\n";
+}
+
+void testBufferManagerLargeVectors() {
+    std::cout << "Running testBufferManagerLargeVectors()...\n";
+
+    size_t large_dim = 1000; 
+    std::vector<float> large_vec(large_dim, 42.0f);
+    auto tuple = std::make_unique<Tuple>();
+    tuple->addField(std::make_unique<Field>(large_vec));
+
+    BufferManager bm(true);
+    bm.extend();
+    for (int i = 0; i < 5; i++) {
+        auto &page = bm.fix_page(i);
+        bool success = page.addTuple(tuple->clone());
+
+        // If doesn't fit, try next page
+        if (!success) {
+            bm.extend();
+        }
+        bm.flushPage(i);
+    }
+
+    std::cout << "testBufferManagerLargeVectors passed!\n";
+}
+
+void testMemoryUsage() {
+    std::cout << "Running testMemoryUsage()...\n";
+    BufferManager bm(true);
+    KDTreeIndex kd(128, bm);
+    
+    std::vector<std::vector<float>> data;
+    size_t data_size = 5000;
+    data.reserve(data_size);
+    std::mt19937 gen(std::random_device{}());
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (size_t i = 0; i < data_size; i++) {
+        std::vector<float> v(128);
+        for (auto &val : v) val = dist(gen);
+        data.push_back(std::move(v));
+    }
+    
+    double mem_before = 0.0;
+    double mem_after = 0.0;
+    mem_before = getCurrentMemoryUsage(); 
+    for (size_t i = 0; i < data_size; i++) {
+        kd.insert(data[i], i);
+    }
+    mem_after = getCurrentMemoryUsage();
+
+    std::cout << "Memory before: " << mem_before << " bytes\n"
+              << "Memory after: " << mem_after << " bytes\n";
+    
+    // Temporary check
+    ASSERT_WITH_MESSAGE(mem_after >= mem_before, "Memory usage after building should be >= before (expected).");
+    std::cout << "testMemoryUsage passed!\n";
+}
+
+std::vector<std::vector<float>> loadGIST1M(const std::string &filename, size_t count) {
+    std::ifstream in(filename, std::ios::binary);
+    if(!in) {
+        throw std::runtime_error("Could not open GIST1M file");
+    }
+
+    std::vector<std::vector<float>> data;
+    data.reserve(count);
+
+    int dim;
+    for (size_t i = 0; i < count; i++) {
+        in.read(reinterpret_cast<char*>(&dim), 4);
+        std::vector<float> vec(dim);
+        in.read(reinterpret_cast<char*>(vec.data()), dim * sizeof(float));
+        if(!in) break;
+        data.push_back(std::move(vec));
+    }
+    return data;
+}
+
+void benchmarkGIST1M() {
+    std::cout << "Running benchmarkGIST1M...\n";
+    size_t subset_size = 10000; 
+    auto data = loadGIST1M("gist1M.fvecs", subset_size);
+
+    std::vector<std::vector<float>> queries(data.begin(), data.begin() + 100);
+
+    VectorIndexBenchmark::IndexConfig hnsw_config{"hnsw", 4,16,100,0};
+    VectorIndexBenchmark benchmark;
+    auto metrics = benchmark.runBenchmark(hnsw_config, data, queries, 10);
+
+    std::cout << "GIST1M Results:\n"
+              << "Build time: " << metrics.build_time << "s\n"
+              << "Query time: " << metrics.query_time << "s\n"
+              << "Memory usage: " << metrics.memory_usage / 1024 / 1024 << "MB\n"
+              << "Accuracy: " << metrics.accuracy * 100 << "%\n";
+
+    ASSERT_WITH_MESSAGE(metrics.accuracy > 0.9, "Expected >90% accuracy on GIST1M subset");
+    std::cout << "benchmarkGIST1M passed!\n";
+}
+
+void tuneHNSWParameters(std::vector<std::vector<float>>& data,
+                        std::vector<std::vector<float>>& queries,
+                        size_t k) {
+    std::vector<size_t> Ms = {8,16,32};
+    std::vector<size_t> efCs = {100,200,300};
+    std::vector<size_t> levels = {4,6};
+
+    VectorIndexBenchmark benchmark;
+    double best_score = -1;
+    VectorIndexBenchmark::IndexConfig best_config;
+
+    for (auto M : Ms) {
+        for (auto efC : efCs) {
+            for (auto lvl : levels) {
+                VectorIndexBenchmark::IndexConfig config{"hnsw", lvl, M, efC, 0};
+                auto metrics = benchmark.runBenchmark(config, data, queries, k);
+
+                double score = metrics.accuracy * (1.0/metrics.query_time);
+                if (score > best_score) {
+                    best_score = score;
+                    best_config = config;
+                }
+            }
+        }
+    }
+
+    std::cout << "Best config: (level=" << best_config.max_level 
+              << ", M=" << best_config.neighbors_size 
+              << ", efC=" << best_config.ef_construction 
+              << ") with score=" << best_score << "\n";
+}
+
+void compareAndLogResults(
+    VectorIndex* hnsw, 
+    VectorIndex* kd, 
+    const std::vector<std::vector<float>>& queries, 
+    size_t k) 
+{
+    double total_recall = 0.0;
+    for (size_t i = 0; i < queries.size(); i++) {
+        auto exact = kd->search(queries[i], k);
+        auto approx = hnsw->search(queries[i], k);
+        double recall = computeRecall(approx, exact);
+        total_recall += recall;
+    }
+    double avg_recall = total_recall / queries.size();
+    std::cout << "[CompareAndLog] Average recall over " << queries.size() 
+              << " queries: " << (avg_recall*100) << "%\n";
+}
+
+
+#ifndef BUZZDB_MAIN_DISABLED
+int main() {
+    try {
+        std::cout << "Starting Vector Database Demo...\n\n";
+        
+        // Run tests
+        testHNSW();
+        testFieldSerialization();
+        testKNNAccuracy(1000, 64, 10);
+        testBufferManagerLargeVectors();
+        testMemoryUsage();
+        
+        std::cout << "\nAll tests completed successfully!\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+}
+#endif
